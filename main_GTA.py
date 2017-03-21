@@ -15,6 +15,7 @@ from ActorNetwork import ActorNetwork
 from CriticNetwork import CriticNetwork
 from pos import current_state
 from OU import OU
+import json
 
 # ip of computer running GTA
 remote_ip = '128.237.99.169'
@@ -100,8 +101,6 @@ buff = ReplayBuffer(BUFFER_SIZE)
 
 
 observation_n = env.reset()
-
-
 reward_n = [0] * env.n
 done_n = [False] * env.n
 info = None
@@ -110,11 +109,13 @@ for i in range(episode_count):
 
     print("Episode : " + str(i) + " Replay Buffer " + str(buff.count()))
 
-
     # get state from environment
     dist_t, area_t = current_state(av_pos)
 
-    # form full state for input to network
+    # todo: since environment is asynchronous, wait until we get a valid state
+    # send no-ops until we are valid
+
+    # compose full state for input to network
     s_t = np.hstack((np.array([l1, l2, l3, l4, av_xpos, av_pos, av_angle], ndmin=2), dist_t))
 
     total_reward = 0.
@@ -137,154 +138,159 @@ for i in range(episode_count):
         v_t = np.maximum(v_t + a_t[0][0] * TAU, 0)
 
 
+        # compute reward of the area captured by "linescans"
+        r_t_ori = r_t_area
+        r_t_area = area_t/area_t0
+        if r_t_area < r_t_ori:
+            r_t = - r_t_area
+        else:
+            r_t = r_t_area
 
-            # ob, r_t, done, info = env.step(a_t[0])
-            r_t_ori = r_t_area
 
-            r_t_area = area_t/area_t0
-            av_pos += 0.5 * (v_t_ori + v_t) *TAU
-            
-            if r_t_area < r_t_ori:
-                r_t = - r_t_area
+        # send action to environment
+        av_pos += 0.5 * (v_t_ori + v_t) *TAU
+        with pyprofile.push('env.step'):
+            observation_n, reward_n, done_n, info = env.step(action_n)
+
+        # compose full state at t+1 and save to buffer
+        dist_t, area_t = current_state(av_pos)
+        s_t1 = np.hstack((np.array([l1, l2, l3, l4, av_xpos, av_pos, av_angle], ndmin=2), dist_t))
+
+        buff.add(s_t, a_t[0], r_t, s_t1, done)  # Add to replay buffer
+
+        # sample a batch from the replay buffer
+        batch = buff.getBatch(BATCH_SIZE)
+        states = np.squeeze(np.asarray([e[0] for e in batch]), axis=1)
+        actions = np.asarray([e[1] for e in batch])
+        rewards = np.asarray([e[2] for e in batch])
+        new_states = np.squeeze(np.asarray([e[3] for e in batch]), axis=1)
+        dones = np.asarray([e[4] for e in batch])
+        # y_t = np.asarray([e[1] for e in batch])
+        y_t = rewards
+
+
+        # update networks using batch
+        target_q_values = critic.target_model.predict([new_states, actor.target_model.predict(new_states)])
+
+        for k in range(len(batch)):
+            if dones[k]:
+                y_t[k] = rewards[k]
             else:
-                r_t = r_t_area
-            # if a_t[0][0] > 0:
-            #     av_pos = destination_pos
-            #     # r_t += 1
-            # else:
-            #     av_pos += 0.5 * 1 * (TAU ** 2)
-            #     r_t -= 0.5
-            if av_pos >= destination_pos:
-                done = True
+                y_t[k] = rewards[k] + GAMMA * target_q_values[k]
 
-            dist_t, area_t = current_state(av_pos)
-            # s_t1 = np.hstack(
-                # (ob.angle, ob.track, ob.trackPos, ob.speedX, ob.speedY, ob.speedZ, ob.wheelSpinVel / 100.0, ob.rpm))
-            s_t1 = np.hstack((np.array([l1, l2, l3, l4, av_xpos, av_pos, av_angle], ndmin=2), dist_t))
+        if (train_indicator):
+            loss += critic.model.train_on_batch([states, actions], y_t)
+            a_for_grad = actor.model.predict(states)
+            grads = critic.gradients(states, a_for_grad)
+            actor.train(states, grads)
+            actor.target_train()
+            critic.target_train()
 
-            buff.add(s_t, a_t[0], r_t, s_t1, done)  # Add to replay buffer
+        total_reward += r_t
+        s_t = s_t1
 
-            # Do the batch update
-            batch = buff.getBatch(BATCH_SIZE)
-            states = np.squeeze(np.asarray([e[0] for e in batch]), axis=1)
-            actions = np.asarray([e[1] for e in batch])
-            rewards = np.asarray([e[2] for e in batch])
-            new_states = np.squeeze(np.asarray([e[3] for e in batch]), axis=1)
-            dones = np.asarray([e[4] for e in batch])
-            # y_t = np.asarray([e[1] for e in batch])
-            y_t = rewards
+        print("Episode", i, "Step", step, "Action", a_t, "Reward", r_t, "Loss", loss)
 
+        step += 1
 
-            target_q_values = critic.target_model.predict([new_states, actor.target_model.predict(new_states)])
+        # check if environment is done
+        # if av_pos >= destination_pos:
+        #     done = True
+        # if done:
+        #     v_t = 0
+        #     av_pos = -10
+        #     done = False
+        #     r_t_area = 1
+        #     break
 
-            for k in range(len(batch)):
-                if dones[k]:
-                    y_t[k] = rewards[k]
-                else:
-                    y_t[k] = rewards[k] + GAMMA * target_q_values[k]
+        if any(done_n) and info and not any(info_n.get('env_status.artificial.done', False) for info_n in info['n']):
+            print "END OF EPISODE"
+            env.reset()
+            break
 
-            if (train_indicator):
-                loss += critic.model.train_on_batch([states, actions], y_t)
-                a_for_grad = actor.model.predict(states)
-                grads = critic.gradients(states, a_for_grad)
-                actor.train(states, grads)
-                actor.target_train()
-                critic.target_train()
+    # # save model parameters every few episodes
+    # if np.mod(i, 3) == 0:
+    #     if (train_indicator):
+    #         print("Now we save model")
+    #         actor.model.save_weights("actormodel.h5", overwrite=True)
+    #         with open("actormodel.json", "w") as outfile:
+    #             json.dump(actor.model.to_json(), outfile)
 
-            total_reward += r_t
-            s_t = s_t1
+    #         critic.model.save_weights("criticmodel.h5", overwrite=True)
+    #         with open("criticmodel.json", "w") as outfile:
+    #             json.dump(critic.model.to_json(), outfile)
 
-            print("Episode", i, "Step", step, "Action", a_t, "Reward", r_t, "Loss", loss)
+    print("TOTAL REWARD @ " + str(i) + "-th Episode  : Reward " + str(total_reward))
+    print("Total Step: " + str(step))
+    print("")
 
-            step += 1
-            if done:
-                v_t = 0
-                av_pos = -10
-                done = False
-                r_t_area = 1
-                break
-
-        if np.mod(i, 3) == 0:
-            if (train_indicator):
-                print("Now we save model")
-                actor.model.save_weights("actormodel.h5", overwrite=True)
-                with open("actormodel.json", "w") as outfile:
-                    json.dump(actor.model.to_json(), outfile)
-
-                critic.model.save_weights("criticmodel.h5", overwrite=True)
-                with open("criticmodel.json", "w") as outfile:
-                    json.dump(critic.model.to_json(), outfile)
-
-        print("TOTAL REWARD @ " + str(i) + "-th Episode  : Reward " + str(total_reward))
-        print("Total Step: " + str(step))
-        print("")
-
-    # env.end()  # This is for shutting down TORCS
-    print("Finish.")
-for i in range(args.max_steps):
-    if render:
-        # Note the first time you call render, it'll be relatively
-        # slow and you'll have some aggregated rewards. We could
-        # open the render() window before `reset()`, but that's
-        # confusing since it pops up a black window for the
-        # duration of the reset.
-        env.render()
-
-    action_n = driver.step(observation_n, reward_n, done_n, info)
-
-    #print observation_n
-    #env.reset()
-    #time.sleep(1)
-
-    try:
-        if info is not None:
-            distance = info['n'][0]['distance_from_destination']
-            logger.info('distance %s', distance)
-    except KeyError as e:
-        logger.debug('distance not available %s', str(e))
-
-    # if args.custom_camera:
-    #     # Sending this every step is probably overkill
-    #     for action in action_n:
-    #         action.append(GTASetting('use_custom_camera', True))
-
-    # Take an action
-    with pyprofile.push('env.step'):
-        _step = env.step(action_n)
-        observation_n, reward_n, done_n, info = _step
-
-    if info is not None:
-        try:
-            x = info['n'][0]['x_coord']
-            y = info['n'][0]['y_coord']
-            z = info['n'][0]['z_coord']
-
-            scans = info['n'][0]['scans']
-
-            print "got scans"
-
-            scan_data = np.zeros((len(scans)+1, 2))
-            scan_data[0,:] = [x, y]
-
-            for i in range(len(scans)):
-                scan_data[i+1, :] = [scans[i]['x'], scans[i]['y']]
-
-            with data_q.mutex:
-                # clear the list
-                data_q.queue[:] = []
-
-            print "adding some data"
-            data_q.put(scan_data)
-
-        except Exception as e:
-            print e
-
-    if any(done_n) and info and not any(info_n.get('env_status.artificial.done', False) for info_n in info['n']):
-        print('done_n', done_n, 'i', i)
-        logger.info('end of episode')
-        env.reset()
 
 # We're done! clean up
 env.close()
+print("Finish.")
+
+
+# for i in range(args.max_steps):
+#     if render:
+#         # Note the first time you call render, it'll be relatively
+#         # slow and you'll have some aggregated rewards. We could
+#         # open the render() window before `reset()`, but that's
+#         # confusing since it pops up a black window for the
+#         # duration of the reset.
+#         env.render()
+
+#     action_n = driver.step(observation_n, reward_n, done_n, info)
+
+
+#     try:
+#         if info is not None:
+#             distance = info['n'][0]['distance_from_destination']
+#             logger.info('distance %s', distance)
+#     except KeyError as e:
+#         logger.debug('distance not available %s', str(e))
+
+#     # if args.custom_camera:
+#     #     # Sending this every step is probably overkill
+#     #     for action in action_n:
+#     #         action.append(GTASetting('use_custom_camera', True))
+
+#     # Take an action
+#     with pyprofile.push('env.step'):
+#         _step = env.step(action_n)
+#         observation_n, reward_n, done_n, info = _step
+
+#     if info is not None:
+#         try:
+#             x = info['n'][0]['x_coord']
+#             y = info['n'][0]['y_coord']
+#             z = info['n'][0]['z_coord']
+
+#             scans = info['n'][0]['scans']
+
+#             print "got scans"
+
+#             scan_data = np.zeros((len(scans)+1, 2))
+#             scan_data[0,:] = [x, y]
+
+#             for i in range(len(scans)):
+#                 scan_data[i+1, :] = [scans[i]['x'], scans[i]['y']]
+
+#             with data_q.mutex:
+#                 # clear the list
+#                 data_q.queue[:] = []
+
+#             print "adding some data"
+#             data_q.put(scan_data)
+
+#         except Exception as e:
+#             print e
+
+#     if any(done_n) and info and not any(info_n.get('env_status.artificial.done', False) for info_n in info['n']):
+#         print('done_n', done_n, 'i', i)
+#         logger.info('end of episode')
+#         env.reset()
+
+# # We're done! clean up
+# env.close()
 
 
