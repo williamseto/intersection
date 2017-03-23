@@ -3,19 +3,80 @@ import argparse
 import logging
 import gym
 import sys
+import numpy as np
 import universe
 from universe import pyprofile, wrappers
+from universe.spaces.joystick_event import JoystickAxisXEvent, JoystickAxisZEvent
 
-from GameSettingsEvent import GTASetting
+from utils.GameSettingsEvent import GTASetting
 import time
 
 # agent includes
+import tensorflow as tf
 from ReplayBuffer import ReplayBuffer
 from ActorNetwork import ActorNetwork
 from CriticNetwork import CriticNetwork
 from pos import current_state
 from OU import OU
 import json
+
+# send "no-operation" action to environment
+def get_noop():
+    x_axis_event = JoystickAxisXEvent(0)
+    z_axis_event = JoystickAxisZEvent(0)
+    noop = [[x_axis_event, z_axis_event]]
+    return noop
+noop_action = get_noop()
+
+def scans2dists(info):
+    x = info['n'][0]['x_coord']
+    y = info['n'][0]['y_coord']
+    car_pos = np.array([x, y])
+
+    scans = info['n'][0]['scans']
+    scan_data = np.zeros((len(scans), 2))
+
+    for i in range(len(scans)):
+        scan_data[i, :] = [scans[i]['x'], scans[i]['y']]
+
+    dists = np.sqrt(np.sum((car_pos-scan_data)**2,axis=1))
+
+    area = sum(1./len(scans) * np.pi * (dists**2))
+
+    return np.array([dists]), area
+
+def get_dest_dist(info):
+    x = info['n'][0]['x_coord']
+    y = info['n'][0]['y_coord']
+    z = info['n'][0]['z_coord']
+    car_pos = np.array([x, y, z])
+    destination_pos = np.array([1776.372, 3706.432, 33.8789])
+    dest_dist = np.sqrt(np.sum((car_pos-destination_pos)**2))
+    return dest_dist
+
+# send no-ops until we get valid state info
+def synchronous_step(env, action):
+
+    # first, send the real action
+    # then wait until we get a response with state info
+    # or should we keep sending the same action??
+
+    while True:
+        observation_n, reward_n, done_n, info = env.step(action)
+
+        try:
+            # if we can access the car position, the rest of the info should be there?
+            _ = info['n'][0]['x_coord']
+            break
+        except Exception as e:
+            pass
+
+        # may need to catch done signal
+        if any(done_n) and info and not any(info_n.get('env_status.artificial.done', False) for info_n in info['n']):
+            env.reset()
+        time.sleep(0.1)
+
+    return observation_n, reward_n, done_n, info
 
 # ip of computer running GTA
 remote_ip = '128.237.99.169'
@@ -27,7 +88,7 @@ vnc_port = '8989'
 websocket_port = '15900'
 
 # create gym-like environment
-env = wrappers.WrappedVNCEnv()
+env = gym.make('gtav.SaneDriving-v0')
 
 # The GymCoreSyncEnv's try to mimic their core counterparts,
 # and thus came pre-wrapped wth an action space
@@ -62,7 +123,6 @@ TAU = 0.1  # Target Network HyperParameter
 LRA = 0.0001  # Learning rate for Actor
 LRC = 0.001  # Lerning rate for Critic
 
-destination_pos = 7 #todo: change
 av_pos = -10 # todo
 av_xpos = 2 # todo
 av_angle = np.pi / 2
@@ -78,7 +138,7 @@ r_t_area = 1
 
 action_dim = 1 #3  # Steering/Acceleration/Brake
 
-state_dim = 25 #29  # of sensors input
+state_dim = 30 #29  # of sensors input
 
 np.random.seed(1337)
 
@@ -105,15 +165,24 @@ reward_n = [0] * env.n
 done_n = [False] * env.n
 info = None
 
+noop_action = get_noop()
+
 for i in range(episode_count):
 
+    step = 0
     print("Episode : " + str(i) + " Replay Buffer " + str(buff.count()))
 
-    # get state from environment
-    dist_t, area_t = current_state(av_pos)
 
-    # todo: since environment is asynchronous, wait until we get a valid state
+    # since environment is asynchronous, wait until we get a valid state
     # send no-ops until we are valid
+    #time.sleep(3)
+    _, _, _, info = synchronous_step(env, noop_action)
+
+    # compute distances from scan locations
+    dist_t, area_t = scans2dists(info)
+    #area_t0 = area_t
+    # todo: make av_pos distance from goal?
+    av_pos = get_dest_dist(info)
 
     # compose full state for input to network
     s_t = np.hstack((np.array([l1, l2, l3, l4, av_xpos, av_pos, av_angle], ndmin=2), dist_t))
@@ -148,12 +217,17 @@ for i in range(episode_count):
 
 
         # send action to environment
-        av_pos += 0.5 * (v_t_ori + v_t) *TAU
+        # av_pos += 0.5 * (v_t_ori + v_t) *TAU
+
+        action_n = [[GTASetting('set_velocity', v_t)]]
         with pyprofile.push('env.step'):
-            observation_n, reward_n, done_n, info = env.step(action_n)
+            observation_n, reward_n, done_n, info = synchronous_step(env, action_n)
+
 
         # compose full state at t+1 and save to buffer
-        dist_t, area_t = current_state(av_pos)
+        dist_t, area_t = scans2dists(info)
+        av_pos = get_dest_dist(info)
+
         s_t1 = np.hstack((np.array([l1, l2, l3, l4, av_xpos, av_pos, av_angle], ndmin=2), dist_t))
 
         buff.add(s_t, a_t[0], r_t, s_t1, done)  # Add to replay buffer
@@ -189,36 +263,45 @@ for i in range(episode_count):
         total_reward += r_t
         s_t = s_t1
 
-        print("Episode", i, "Step", step, "Action", a_t, "Reward", r_t, "Loss", loss)
+        print("Episode", i, "Step", step, "Action", (a_t, v_t), "Reward", r_t, "Loss", loss)
 
         step += 1
 
         # check if environment is done
-        # if av_pos >= destination_pos:
-        #     done = True
-        # if done:
-        #     v_t = 0
-        #     av_pos = -10
-        #     done = False
-        #     r_t_area = 1
-        #     break
+        # hack for now: reset on agent side; should ideally happen on environment side
+        # because updates come slowly over the connection; we might pass our goal position
+
+        dest_dist = av_pos
+        print ("DISTANCE TO DEST: ", dest_dist)
+
+        # meters?
+        if dest_dist <= 5:
+            v_t = 0
+            r_t_area = 1
+            env.reset()
+            break
+
 
         if any(done_n) and info and not any(info_n.get('env_status.artificial.done', False) for info_n in info['n']):
             print "END OF EPISODE"
             env.reset()
+
+            v_t = 0
+            r_t_area = 1
+
             break
 
-    # # save model parameters every few episodes
-    # if np.mod(i, 3) == 0:
-    #     if (train_indicator):
-    #         print("Now we save model")
-    #         actor.model.save_weights("actormodel.h5", overwrite=True)
-    #         with open("actormodel.json", "w") as outfile:
-    #             json.dump(actor.model.to_json(), outfile)
+    # save model parameters every few episodes
+    if np.mod(i, 10) == 0:
+        if (train_indicator):
+            print("Now we save model")
+            actor.model.save_weights("actormodel.h5", overwrite=True)
+            with open("actormodel.json", "w") as outfile:
+                json.dump(actor.model.to_json(), outfile)
 
-    #         critic.model.save_weights("criticmodel.h5", overwrite=True)
-    #         with open("criticmodel.json", "w") as outfile:
-    #             json.dump(critic.model.to_json(), outfile)
+            critic.model.save_weights("criticmodel.h5", overwrite=True)
+            with open("criticmodel.json", "w") as outfile:
+                json.dump(critic.model.to_json(), outfile)
 
     print("TOTAL REWARD @ " + str(i) + "-th Episode  : Reward " + str(total_reward))
     print("Total Step: " + str(step))
@@ -228,69 +311,5 @@ for i in range(episode_count):
 # We're done! clean up
 env.close()
 print("Finish.")
-
-
-# for i in range(args.max_steps):
-#     if render:
-#         # Note the first time you call render, it'll be relatively
-#         # slow and you'll have some aggregated rewards. We could
-#         # open the render() window before `reset()`, but that's
-#         # confusing since it pops up a black window for the
-#         # duration of the reset.
-#         env.render()
-
-#     action_n = driver.step(observation_n, reward_n, done_n, info)
-
-
-#     try:
-#         if info is not None:
-#             distance = info['n'][0]['distance_from_destination']
-#             logger.info('distance %s', distance)
-#     except KeyError as e:
-#         logger.debug('distance not available %s', str(e))
-
-#     # if args.custom_camera:
-#     #     # Sending this every step is probably overkill
-#     #     for action in action_n:
-#     #         action.append(GTASetting('use_custom_camera', True))
-
-#     # Take an action
-#     with pyprofile.push('env.step'):
-#         _step = env.step(action_n)
-#         observation_n, reward_n, done_n, info = _step
-
-#     if info is not None:
-#         try:
-#             x = info['n'][0]['x_coord']
-#             y = info['n'][0]['y_coord']
-#             z = info['n'][0]['z_coord']
-
-#             scans = info['n'][0]['scans']
-
-#             print "got scans"
-
-#             scan_data = np.zeros((len(scans)+1, 2))
-#             scan_data[0,:] = [x, y]
-
-#             for i in range(len(scans)):
-#                 scan_data[i+1, :] = [scans[i]['x'], scans[i]['y']]
-
-#             with data_q.mutex:
-#                 # clear the list
-#                 data_q.queue[:] = []
-
-#             print "adding some data"
-#             data_q.put(scan_data)
-
-#         except Exception as e:
-#             print e
-
-#     if any(done_n) and info and not any(info_n.get('env_status.artificial.done', False) for info_n in info['n']):
-#         print('done_n', done_n, 'i', i)
-#         logger.info('end of episode')
-#         env.reset()
-
-# # We're done! clean up
-# env.close()
 
 
